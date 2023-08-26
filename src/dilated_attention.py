@@ -2,10 +2,9 @@ from typing import Union, List
 import torch
 import numpy as np
 
-BIG_NEGATIVE_SCALAR = -10000.
+DROPOUT_RATE = 0.2
 
-
-def _make_alibi(l, m = 1/512 * 0.5, is_causal = True, device = None):
+def _make_alibi(l, m = 1., is_causal = True, device = None):
     """
     make alibi embeddings of size "l"
     Args:
@@ -14,10 +13,12 @@ def _make_alibi(l, m = 1/512 * 0.5, is_causal = True, device = None):
     """
     V = []
     for i in range(l):
-        v = [-i+l for i in range(i+1+l-1,i+2, -1)]
+        v = [np.float32(-i+l) for i in range(i+1+l-1,i, -1)]
         V.append(v)
         
-    V = torch.from_numpy(np.array(V).astype('float32'), device = device)
+    V = torch.Tensor(np.array(V).astype('float32')).to(device)
+    assert( all ( [s==l for s in V.shape]))
+           
     if is_causal:
         V = torch.tril(V)
     return V * m
@@ -26,66 +27,61 @@ def _make_causal_bool(att_length, device = None):
     c = torch.tril(torch.ones(att_length,att_length,dtype=torch.bool)).to(device)
     return c
 
-def _single_head_diagonal_block_self_attention(x_sliced, Wk, Wq,Wv, P = None, dilation = 1, norm_fact = 1., causal_mask = None):
-    """
-    This function computes self attention for strided/sliced inputs
-    """
-    
-    Q = torch.einsum('ijkl,mk -> ijlm', x_sliced[:,:,:,::dilation],Wq)
-    K = torch.einsum('ijkl,mk -> ijlm', x_sliced[:,:,:,::dilation],Wk)
-    V = torch.einsum('ijkl,mk -> ijlm', x_sliced[:,:,:,::dilation],Wv)
-    KQ = torch.einsum('ijkp, ijop -> ijko',K, Q)
 
+def _single_head_dilated_segmented_self_attention(
+        x_sliced,
+        Wk,
+        Wq,
+        Wv,
+        P = None,
+        dilation = 1,
+        norm_fact = 1.,
+        causal_mask = None
+    ):
+
+    # Dimensions:
+    # x    : [batch] [segment] [emb] [t]
+    # Wk   : [emb]   [d]
+    # K    : [batch] [segment] [d] [t] 
+
+
+    Q  = torch.einsum('ijkl, mk   ->  ijlm', x_sliced[:,:,:,::dilation],Wq)
+    K  = torch.einsum('ijkl, mk   ->  ijlm', x_sliced[:,:,:,::dilation],Wk)
+    V  = torch.einsum('ijkl, mk   ->  ijlm', x_sliced[:,:,:,::dilation],Wv)
+    KQ = torch.einsum('ijkl, ijml ->  ijkm',K, Q)
     if causal_mask is not None:
-        KQ = KQ * causal_mask 
-        KQ = KQ + (~causal_mask * BIG_NEGATIVE_SCALAR)
-
-    if P is not None:
-        # The alibi embeddings need to take into account both segment size and 
-        # dilation! 
-        p_s = P.shape[0] # P is square - does not matter which dimension to chose
-        segm_count = x_sliced.shape[1] # see x_in.view... section
-        # I'm applying the same transformation I applied to the "x_in" sequence dimension to 
-        # both dimensions of "P" to get the correct values. Possible slight perf. improvement with
-        # indexing-based computation.
-        p_reshaped = P.view(p_s//segm_count, segm_count,p_s//segm_count, segm_count)[::dilation,:,::dilation,:]
-        p_dilated_segmented = p_reshaped[:,0,:,0] # for each segment these are the same again. It does not matter which one to take. 
-        KQ = KQ + p_dilated_segmented
-
-    #if P is not None:
-    #    print(P.shape)
-    #    print(KQ.shape)
-    #    KQ = KQ + P[::dilation, ::dilation]
-    #print(KQ.shape)
-
-    smKQ = torch.nn.functional.softmax(KQ * norm_fact, dim = 2)
-    att = torch.einsum('ijld, ijlm-> ijdm',smKQ, V)
-    return att ,(K, Q, smKQ)
+        KQ = KQ * causal_mask
+        KQ[:,:,~causal_mask] = float('-inf')
+    
+    # if P is not None:
+    #     p_s = x_sliced.shape[-1] * dilation
+    #     segm_count = x_sliced.shape[1]
+    #     p_reshaped = P[:p_s,:p_s].view(p_s//segm_count, segm_count,p_s//segm_count, segm_count)[::dilation,:,::dilation,:]
+    #     p_dilated_segmented = p_reshaped[:,0,:,0]
+    #     # p_dilated_segmented = P[:p_s//dilation,:p_s//dilation]
+    #     KQ = KQ + p_dilated_segmented
+    
+    smKQ = torch.nn.functional.softmax(KQ * norm_fact, dim = 3)
+    att = torch.einsum('ijnm ,ijnk-> ijmk',smKQ, V)
+    return att, (K, Q, smKQ)
     
 class SingleHeadDilatedSelfAttention(torch.nn.Module):
     def __init__(
-        self,
-        d_k = 32,
-        d_v = None,
-        d_model = None,
-        dilation = 1,
-        segment_size = 16,
-        pos_emb_scaling = 1.,
-        device = 'cpu',
-        padding = 'same',
-        is_causal = True,
-        use_layer_norm = False
-    ):
+            self,
+            d_k = 32,
+            d_v = None,
+            d_model = None,
+            dilation = 1,
+            segment_count = 16,
+            pos_emb_scaling = 1.,
+            device = 'cpu',
+            padding = 'same',
+            is_causal = True
+        ):
         super(SingleHeadDilatedSelfAttention, self).__init__()
         """Breaks a sequence to segments and computes dilated single-head attention. 
 
         This module returns tensors of smaller size than the ones entered, except if dilation==1
-
-        Restrictions:
-        -------------
-         * [segment_size] x [dilation_rate] must be smaller than the input provided.
-         * The input must be an integer multiple of [segment_size]*[dilation_rate]. 
-           (this restriction can be removed by appropriate padding).
         
         Does some dangerous tricks with reshaping and einsums.
         
@@ -99,7 +95,7 @@ class SingleHeadDilatedSelfAttention(torch.nn.Module):
 
             dilation : how many elements are skipped from the sequence (==1 no element is skipped, ==2, every 1 element)
 
-            segment_size : the size of the segments that the input sequence is first split (before 
+            segment_count : the size of the segments that the input sequence is first split (before 
                        using the dilation). 
 
             device   : in which device to keep the layer
@@ -110,9 +106,6 @@ class SingleHeadDilatedSelfAttention(torch.nn.Module):
                              multiple heads. 
 
             is_causal : (True/False) whether the layer is a causal (decoder) layer
-
-            use_layer_norm : (False) whether to normalize the layer (not necessary - can be removed eventually)
-
                              
         """
 
@@ -122,58 +115,42 @@ class SingleHeadDilatedSelfAttention(torch.nn.Module):
         self.d_v = d_v
         self.d_model = d_model
         self.dilation = dilation
-        self.segment_size = segment_size
+        self.segment_count = segment_count
         self.device = device 
         self._is_built = False
         self.norm_fact = torch.scalar_tensor(1./np.sqrt(self.d_k)).to(device)
         self.padding = padding
         self.is_causal = is_causal
         self.causal_mask = None
-        self.use_layer_norm = use_layer_norm
         self.pos_emb_scaling = pos_emb_scaling
 
 
     def build_from_in_shape(
-        self,
-        in_shape
-    ):
-        
+            self,
+            in_shape
+        ):
         """
         Builds the necessary weights if not already available.
         Assuming B x T x E tensor ( (batch dim) x (time dim) x (embedding dim) )
         """
         assert(len(in_shape) == 3)
-        # if (in_shape[1] % (self.segment_size * self.dilation)) != 0:
-        #     raise Exception('Currently, input length and S = [segment_size]*[dilation_rate] are supported only when they are integer multiples. \n ' + \
-        #                     'Moreover, the input tensor should be at least 1 x S.\n' + \
-        #                     'The provided input dimension is %i whereas S = %i x %i = %i'%(
-        #                             in_shape[1],
-        #                             self.segment_size, 
-        #                             self.dilation,self.segment_size *self.dilation
-        #                         )
-        #                     )
             
         if self.d_model is None:
             self.d_model = in_shape[2]
-        wk = torch.from_numpy(np.random.randn(self.d_k,self.d_model).astype(np.float32)/np.sqrt(self.d_k)).to(self.device)
-        wq = torch.from_numpy(np.random.randn(self.d_k,self.d_model).astype(np.float32)/np.sqrt(self.d_k)).to(self.device)
-        wv = torch.from_numpy(np.random.randn(self.d_v,self.d_model).astype(np.float32)/np.sqrt(self.d_k)).to(self.device)
 
-        self.Wk = torch.nn.Parameter(wk)
-        self.Wq = torch.nn.Parameter(wq)
-        self.Wv = torch.nn.Parameter(wv)
-        self.Wk.requires_grad = True
-        self.Wq.requires_grad = True
-        self.Wv.requires_grad = True
-
+        def _get_param(k,m, dtype = 'float32'):
+            v = torch.from_numpy(np.random.randn(k,m).astype(dtype)/np.sqrt(k)).to(self.device)
+            p = torch.nn.Parameter(v)
+            p.requires_grad = True
+            return p
+        
+        self.Wk = _get_param(self.d_k, self.d_model)
+        self.Wq = _get_param(self.d_k,self.d_model)
+        self.Wv = _get_param(self.d_v,self.d_model)
         self._is_built = True
-        
         if self.is_causal:
-            self.causal_mask = _make_causal_bool(in_shape[1]//self.segment_size, device =self.device)[::self.dilation, ::self.dilation]
-
-        if self.use_layer_norm:
-            self.layer_norm = torch.nn.LayerNorm([self.d_v], device = self.device)
-        
+            self.causal_mask = _make_causal_bool(in_shape[1]//self.segment_count, device =self.device)[::self.dilation, ::self.dilation]
+        self.dropout = torch.nn.Dropout(DROPOUT_RATE)
 
     def build(self, x_in):
         self.build_from_in_shape(x_in.shape)
@@ -182,9 +159,9 @@ class SingleHeadDilatedSelfAttention(torch.nn.Module):
         return self.Wk, self.Wq, self.Wv
     
     def output_shape(
-        self,
-        x_in = None
-    ):
+            self,
+            x_in = None
+        ):
         if self._is_built:
             dim1 = None
             dim2 = None
@@ -196,27 +173,28 @@ class SingleHeadDilatedSelfAttention(torch.nn.Module):
                 return (dim1, dim2, self.d_v)
                 
             if self.padding =='no_padding':
-                return (dim1, dim2//self.segment_size, self.d_v)
+                return (dim1, dim2//self.segment_count, self.d_v)
                 
         raise Exception("Not implemented!")
         
     
     def forward(
-        self,
-        x_in,
-        positional_embeddings_KQ = None
-    ):
+            self,
+            x_in,
+            positional_embeddings_KQ = None,
+            return_smKQ = False,
+        ):
         """
         optionally pass positional embeddings (the layer itself does not have them!)
         """
         if not self._is_built:
             self.build(x_in)
         
-        x_view = x_in.view(x_in.shape[0],x_in.shape[1]//self.segment_size, self.segment_size, x_in.shape[2]).permute(0,2,3,1)
+        x_view = x_in.view(x_in.shape[0],x_in.shape[1]//self.segment_count, self.segment_count, x_in.shape[2]).permute(0,2,3,1)
         if positional_embeddings_KQ is not None:
             positional_embeddings_KQ *= self.pos_emb_scaling
 
-        att, _ = _single_head_diagonal_block_self_attention(
+        att, (K, Q, smKQ) = _single_head_dilated_segmented_self_attention(
             x_view, 
             self.Wk,
             self.Wq,
@@ -236,22 +214,23 @@ class SingleHeadDilatedSelfAttention(torch.nn.Module):
             
         if self.padding == 'return_orig_output':
             res = att            
-        if self.use_layer_norm:
-            res = self.layer_norm(res)
+
+        if return_smKQ:
+            return res, smKQ
         return res
 
 class MultiHeadDilatedAttention(torch.nn.Module):
     def __init__(
-            self,
-            d_k = 256,
-            d_v = None,
-            dilation_schedule = [1,2,4,8],
-            segment_schedule : Union[List, int] = 128, 
-            pos_emb_scaling = None,
-            device = 'cpu',
-            is_causal = True,
-            linear_out_size = None,
-    ):
+                self,
+                d_k = 256,
+                d_v = None,
+                dilation_schedule = [1,2,4,8],
+                segment_schedule : Union[List, int] = 128, 
+                pos_emb_scaling = None,
+                device = 'cpu',
+                is_causal = True,
+                linear_out = True,
+        ):
         super(MultiHeadDilatedAttention, self).__init__()
         """
         The multi-head dilated attention layer (similar to the LongNet paper)
@@ -267,7 +246,7 @@ class MultiHeadDilatedAttention(torch.nn.Module):
           pos_emb_scaling : the scaling to apply to the positional embedding. A single pos. emb. matrix is computed
              and shared with all heads (and blocks is there are several blocks). This is achieved by simply passing
              the positional embedding to the "forward" function but scaling it differently for each head (ass suggested)
-             by the alibi paper). 
+             by the ALiBI paper). 
         """
         self.d_k = d_k
         self.d_v = d_v
@@ -281,79 +260,93 @@ class MultiHeadDilatedAttention(torch.nn.Module):
         self._is_built = False
         self.device = device 
         self.is_causal = is_causal
-        self.linear_out_size = linear_out_size
-        self.dropout = torch.nn.Dropout(0.2)
+        self.linear_out = linear_out
+        self.dropout = torch.nn.Dropout(DROPOUT_RATE)
         
     def build(
-        self,
-        x_in
-    ):
+            self,
+            x_in
+        ):
         self.heads = torch.nn.ModuleList()
-        seg_length = max([d * s for d,s in zip(self.segment_schedule, self.dilation_schedule)])
         if self.pos_emb_scaling is None:
             self.pos_emb_scaling = [1. for i in range(len(self.dilation_schedule))]
 
         if isinstance(self.pos_emb_scaling,float):
             self.pos_emb_scaling = [self.pos_emb_scaling for i in range(len(self.dilation_schedule))]
 
-        
-        for dilation, segment_size, pos_emb_scaling in zip(self.dilation_schedule, self.segment_schedule, self.pos_emb_scaling):
-
+        for dilation, segment_count, pos_emb_scaling in zip(self.dilation_schedule, self.segment_schedule, self.pos_emb_scaling):
             head = SingleHeadDilatedSelfAttention(
                 d_k = self.d_k,
                 d_v = self.d_v,
                 dilation= dilation,
-                segment_size= segment_size,
+                segment_count= segment_count,
                 padding='same',
                 device = self.device,
                 is_causal = self.is_causal,
-                use_layer_norm = False,
                 pos_emb_scaling = pos_emb_scaling
             )
-
-
             head.build(x_in)
             self.heads.append(head)
             
-        if self.linear_out_size:
-            # not actually used in the transformer - I have the linear layer in the block 
-            # for better flexibility.
-            self.dense_out = torch.nn.Linear(self.heads[-1].d_model, self.linear_out_size, bias=True, device = self.device)
-
+        if self.linear_out:
+            concat_out_shape = sum([h.Wv.shape[0] for h in  self.heads])
+            self.dense_out = torch.nn.Linear(
+                concat_out_shape, 
+                x_in.shape[-1],
+                bias=False, 
+                device = self.device
+            )
         # Create the alibi embeddings for this layer
         self._is_built = True
 
     def forward(
-        self, 
-        x_in,
-        positional_embeddings_KQ = None,
-    ):
+            self, 
+            x_in,
+            positional_embeddings_KQ = None,
+            return_attention_outputs = False
+        ):
         if not self._is_built:
             self.build(x_in)
-            
 
-        head_outputs = torch.cat([head_module(x_in, positional_embeddings_KQ = positional_embeddings_KQ) for head_module in self.heads], axis = -1)
+        head_outputs_list = []
+        out_smKQ = []
+        for head_module in self.heads:
+            att, smKQ = head_module.forward(
+                x_in,
+                positional_embeddings_KQ = positional_embeddings_KQ,
+                return_smKQ = True
+            )
+            head_outputs_list.append(att)
 
-        if self.linear_out_size is not None:
+            if return_attention_outputs:            
+                out_smKQ.append(att)
+        head_outputs = torch.cat(head_outputs_list, axis = -1)
+
+        if self.linear_out:
+            hh = self.dense_out(head_outputs)
+            hh = self.dropout(hh)
+        else:
             hh = self.dropout(head_outputs)
-            hh = self.dense_out(hh)
-            head_outputs = torch.nn.functional.gelu(hh)
 
-        return head_outputs
+        if return_attention_outputs:
+            return hh, head_outputs_list
+        return hh
     
 
 class DilatedTransformerBlock(torch.nn.Module):
     def __init__(
-        self,
-        d_k = 32,
-        num_heads = 16, 
-        dilation_schedule = [1,2,4,8],
-        segment_schedule = [1024,1024,512,512],
-        device = 'cpu',
-        max_seq_length = None,
-        is_causal = True,
-        pos_emb_scaling : Union[float, List[float]] = 1.
-    ):
+            self,
+            d_k = 32,
+            num_heads = 16, 
+            dilation_schedule = [1,2,4,8],
+            segment_schedule = [1024,1024,512,512],
+            device = 'cpu',
+            max_seq_length = None,
+            is_causal = True,
+            pos_emb_scaling : Union[float, List[float]] = 1.,
+            use_dropout = True,
+            out_linear_size = None
+        ):
         super(DilatedTransformerBlock, self).__init__()
         """
         The heads' last dimension is concatenated to be added again back to the input tensor.
@@ -390,6 +383,8 @@ class DilatedTransformerBlock(torch.nn.Module):
         super(DilatedTransformerBlock, self).__init__()
         self.device = device 
         assert(len(dilation_schedule) == len(segment_schedule))
+                    
+        self.out_linear_size = out_linear_size
 
         if num_heads > len(dilation_schedule):
             segment_schedule = [segment_schedule[i % len(segment_schedule)] for i in range(num_heads)]
@@ -400,24 +395,28 @@ class DilatedTransformerBlock(torch.nn.Module):
         self.segment_schedule = segment_schedule
         self.dilation_schedule = dilation_schedule
         self._is_built = False
+        self.use_dropout = use_dropout
+        self.is_causal = is_causal
+
         if max_seq_length is None:
             max_seq_length = max([d * s for d,s in zip(self.segment_schedule, self.dilation_schedule)])
 
+        self.out_linear_size = out_linear_size
+
         ## Positional embeddings:
         self.max_seq_length = max_seq_length # for the construction of "Alibi" positional embeddings.
-        # self.P = _make_alibi(self.max_seq_length,1/self.max_seq_length, is_causal = is_causal)
         self.pos_emb_scaling = pos_emb_scaling
-        # self.register_buffer('P',P)
 
     def _build(self, x_in):
         """
         Builds the layers given input of a speciffic size
         """
         self.emb_dimension = x_in.shape[-1]
-        # self.d_model = self.emb_dimension // self.num_heads
+
+        
+         # self.d_model = self.emb_dimension // self.num_heads
         assert(self.emb_dimension % self.num_heads == 0)
         if (x_in.shape[2] != self.emb_dimension):
-            print(x_in.shape, self.emb_dimension)
             raise Exception('The input size does not seem to be correct! in: %i expected (emb_dimension): %i '%(x_in.shape[2], self.emb_dimension))
         self.per_head_out_size = self.emb_dimension // self.num_heads
 
@@ -428,30 +427,53 @@ class DilatedTransformerBlock(torch.nn.Module):
             dilation_schedule = self.dilation_schedule,
             pos_emb_scaling = self.pos_emb_scaling,
             device = self.device,
-            is_causal = True, 
-            linear_out_size = self.emb_dimension
+            is_causal = self.is_causal
         )
 
         mhsa.build(x_in)
         self.mhsa_module = mhsa
-        self.layer_norm_a = torch.nn.LayerNorm(normalized_shape = [x_in.shape[1],self.emb_dimension],device = self.device)
-        self.layer_norm_b = torch.nn.LayerNorm(normalized_shape = [x_in.shape[1],self.emb_dimension],device = self.device)
-        self.dense = torch.nn.Linear(self.emb_dimension, self.emb_dimension, device = self.device, bias = True)
-        self._is_built = True
-        self.dropout = torch.nn.Dropout(0.2)
 
-    def forward(self,x_in, positional_embedding_KQ = None):
+        if self.out_linear_size is None:
+            self.out_linear_size = self.emb_dimension * 4
+        
+        self.out_dense = torch.nn.Sequential(
+            torch.nn.Linear( self.emb_dimension , self.out_linear_size, bias =True, device = self.device),
+            torch.nn.ReLU(),
+            torch.nn.Linear(self.out_linear_size, self.emb_dimension , bias = True, device = self.device),
+            torch.nn.Dropout(DROPOUT_RATE)
+        )
+
+        # self.layer_norm_a = torch.nn.LayerNorm(normalized_shape = [x_in.shape[1],self.emb_dimension],device = self.device)
+        self.layer_norm_a = torch.nn.LayerNorm(normalized_shape = [self.emb_dimension],device = self.device)
+        self.layer_norm_b = torch.nn.LayerNorm(normalized_shape = [self.emb_dimension],device = self.device)
+        self._is_built = True
+        if self.use_dropout:
+            self.dropout = torch.nn.Dropout(DROPOUT_RATE)
+
+    def forward(self,x_in, positional_embedding_KQ = None, att_outputs = False):
         """
         Args:
           x_in : a pytorch tensor (input) : shape (n_seq x n_emb)
           positional_embedding_KQ (optional) : A positional embedding to be applied (additively) to the KQ attention output.
-        
         """
         if not self._is_built:
             self._build(x_in)
+        h = self.layer_norm_a(x_in)
+        if att_outputs:
+            mhsa_out, smKQ = self.mhsa_module(
+                h, positional_embedding_KQ, return_attention_outputs = True
+            )
+        else:
+            mhsa_out = self.mhsa_module.forward(
+                h,
+                positional_embedding_KQ, 
+                return_attention_outputs = False
+            )
+        h = self.layer_norm_b(mhsa_out + x_in)
+        h = self.out_dense(h)
 
-        h = (self.mhsa_module(x_in, positional_embedding_KQ) + x_in)
-        hd = self.dropout(h)
-        h = self.layer_norm_a(h)
+        if att_outputs:
+            return h, smKQ
+        
         return h
     
