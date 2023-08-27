@@ -24,8 +24,9 @@ class TestModules(unittest.TestCase):
         BATCH_LEN = 4
         N_LAYERS = 8
         dilation_schedule = [1, 2, 4  ,  8, 16 , 32  , 64 ]*2
-        segment_schedule     = [4, 8, 16 , 32, 64 , 128 , 256]*2
-        sub_segment_splits =  [SEGMENT_LENGTH//k for k in segment_schedule]
+        segment_sizes     = [4, 8, 16 , 32, 64 , 128 , 256]*2
+        segment_schedule =  [SEGMENT_LENGTH//k for k in segment_sizes]
+
         num_heads = len(dilation_schedule)
         emb_per_head = 16
         emb_dim = num_heads * emb_per_head
