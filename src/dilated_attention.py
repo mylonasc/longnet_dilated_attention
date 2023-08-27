@@ -3,25 +3,7 @@ import torch
 import numpy as np
 
 DROPOUT_RATE = 0.2
-
-def _make_alibi(l, m = 1., is_causal = True, device = None):
-    """
-    make alibi embeddings of size "l"
-    Args:
-      l : the size of the self-attention matrix
-      m : the scaling for the embeddings 
-    """
-    V = []
-    for i in range(l):
-        v = [np.float32(-i+l) for i in range(i+1+l-1,i, -1)]
-        V.append(v)
-        
-    V = torch.Tensor(np.array(V).astype('float32')).to(device)
-    assert( all ( [s==l for s in V.shape]))
-           
-    if is_causal:
-        V = torch.tril(V)
-    return V * m
+DTYPE = torch.float32
 
 def _make_causal_bool(att_length, device = None):
     c = torch.tril(torch.ones(att_length,att_length,dtype=torch.bool)).to(device)
@@ -55,7 +37,6 @@ def _single_head_dilated_segmented_self_attention(
     
     if P is not None:
         p_s = x_sliced.shape[-1]
-        # print(p_s//segm_count, segm_count,p_s//segm_count, segm_count)
         p_reshaped = P[:p_s,:p_s][::dilation,::dilation]
         KQ = KQ + p_reshaped
     
@@ -66,7 +47,7 @@ def _single_head_dilated_segmented_self_attention(
 class SingleHeadDilatedSelfAttention(torch.nn.Module):
     def __init__(
             self,
-            d_k = 32,
+            d_k = None,
             d_v = None,
             d_model = None,
             dilation = 1,
@@ -136,8 +117,8 @@ class SingleHeadDilatedSelfAttention(torch.nn.Module):
         if self.d_model is None:
             self.d_model = in_shape[2]
 
-        def _get_param(k,m, dtype = 'float32'):
-            v = torch.from_numpy(np.random.randn(k,m).astype(dtype)/np.sqrt(k)).to(self.device)
+        def _get_param(k,m, dtype = DTYPE):
+            v = torch.randn((k,m) , dtype = DTYPE, device = self.device) / torch.math.sqrt(k)
             p = torch.nn.Parameter(v)
             p.requires_grad = True
             return p
@@ -220,7 +201,7 @@ class SingleHeadDilatedSelfAttention(torch.nn.Module):
 class MultiHeadDilatedAttention(torch.nn.Module):
     def __init__(
                 self,
-                d_k = 256,
+                d_k = None,
                 d_v = None,
                 dilation_schedule = [1,2,4,8],
                 segment_schedule : Union[List, int] = 128, 
@@ -237,8 +218,8 @@ class MultiHeadDilatedAttention(torch.nn.Module):
           `SingleHeadDilatedSelfAttention`
           
         Args:
-          d_k : key size
           d_v : value size
+          d_k : key size (can be ommitted if d_v is provided and num_heads is clear from the length of dilation_schedule)
           dilation_schedule : dilated attention relevant parameter (how many samples to skip)
           segment_schedule :  dilated attention relevant parameter: how many blocks to split (segments) the input sequence.
           pos_emb_scaling : the scaling to apply to the positional embedding. A single pos. emb. matrix is computed
@@ -246,14 +227,32 @@ class MultiHeadDilatedAttention(torch.nn.Module):
              the positional embedding to the "forward" function but scaling it differently for each head (ass suggested)
              by the ALiBI paper). 
         """
-        self.d_k = d_k
-        self.d_v = d_v
         self.pos_emb_scaling = pos_emb_scaling
         self.dilation_schedule = dilation_schedule
 
         if not isinstance(segment_schedule, list):
+            print("!! setting the segment schedule to the \
+                   same size as the dilation schedule \
+                   provided. For more control on the \
+                   architecture, please provide both \
+                   dilation and segment schedules.")
             segment_schedule = [segment_schedule] * len(dilation_schedule)
-            
+
+        if len(segment_schedule) != len(dilation_schedule):
+            raise Exception("Different segment and dilation schedule lists were provided! These must be the same. Aborting init. ")
+
+        self.num_heads = len(self.dilation_schedule)
+
+        self.d_k = d_k
+        self.d_v = d_v
+        if self.d_k is None: 
+            # this is for the key and querry matrices.
+            # In multi-head attention, d_v
+            # is simply = self.d_k * self.num_heads.
+            # This allows determining the d_k:
+            self.d_k = self.d_v // self.num_heads
+            print("determining automatically key and query matrix sizes (internal transformer parameters) through d_v: %i, d_k = d_v/num_heads: %i"%(self.d_v, self.d_k))
+                    
         self.segment_schedule = segment_schedule
         self._is_built = False
         self.device = device 
@@ -267,9 +266,11 @@ class MultiHeadDilatedAttention(torch.nn.Module):
         ):
         self.heads = torch.nn.ModuleList()
         if self.pos_emb_scaling is None:
+            print("setting automatically all pos embedding scalings to 1. ")
             self.pos_emb_scaling = [1. for i in range(len(self.dilation_schedule))]
 
         if isinstance(self.pos_emb_scaling,float):
+            print("setting all pos embedding scalings to %2.3f "%(self.pos_emb_scaling))
             self.pos_emb_scaling = [self.pos_emb_scaling for i in range(len(self.dilation_schedule))]
 
         for dilation, segment_count, pos_emb_scaling in zip(self.dilation_schedule, self.segment_schedule, self.pos_emb_scaling):
@@ -334,17 +335,21 @@ class MultiHeadDilatedAttention(torch.nn.Module):
 class DilatedTransformerBlock(torch.nn.Module):
     def __init__(
             self,
-            d_k = 32,
+            d_k = None,
             num_heads = 16, 
             dilation_schedule = [1,2,4,8],
             segment_schedule = [1024,1024,512,512],
-            device = 'cpu',
             max_seq_length = None,
-            is_causal = True,
             pos_emb_scaling : Union[float, List[float]] = 1.,
             use_dropout = True,
-            out_linear_size = None
+            out_linear_size = None,
+            build_lazy = False,
+            emb_dimension = None,
+            segment_length = None,
+            device = 'cpu',
+            is_causal = True
         ):
+
         super(DilatedTransformerBlock, self).__init__()
         """
         The heads' last dimension is concatenated to be added again back to the input tensor.
@@ -359,26 +364,41 @@ class DilatedTransformerBlock(torch.nn.Module):
             d_model = [embedding size] // [num_heads]
 
         Args:
-          num_layers : the number of MultiHeadAttentionBlocks MHDA
+            d_k : the internal size of the key and querry matrices. If it is not provided it is 
+                  determined from d_v and num_heads.
 
-          num_heads  : the number of heads per MHDA.
+            num_heads : The number of heads for the MHSA layers
 
-          dilation_schedule : the order of dilations for the heads to be created 
-                       (1 dilation = 1 head). 
+            dilation_schedule : arrays that determine the dilation schedules.
 
-          segment_schedule  : the order of segment lengths (1 length == 1 head)
+            segment_schedule   :arrays that determine the segment size schedules.
 
-          device : the device on where to constr. the model 
+            max_seq_length  : the maximum length of the sequence (it helps with efficiency to keep this static)
+            
+            pos_emb_scaling : (same size as the heads) - scaling for the positional embeddings (can be different for each head as in ALiBI)
 
-          max_seq_length : (None) the maximum sequence (used to create the alibi embeddings)
+            use_dropout : (always... or else.)
 
-          is_causal : whether to causally mask or not
+            out_linear_size : (None) Final projection of outputs. in the original "Attention is all you need" paper, this is 4 x (V out size). 
+                            The 4xemb size is also adopted here.
+                            Note:
+                            It may be possible to get away with smaller sizes (Note that this does not affect the embedding size output!)
+                            There is literature replacing this FFNN with micture of experts - potentially check this out in the future. 
+                            This is a very memory-heavy parameter.
+            
+            build_lazy : whether to actually build the layer or build it when the first input is encountered (laziness is good for experimentation)
 
-          pos_emb_scaling : the scaling for the embeddings (typically different scaling
-                      is used for different heads)
+            emb_dimension : The dimension of the (concatenated) embedding.
 
+            segment_length : The (static) length of the segment processed. This is good for efficiency (and for automated JIT compiling later on).
+
+            device  : where to keep this layer
+
+            is_causal : whether to use causal masking or not.
         """
         super(DilatedTransformerBlock, self).__init__()
+
+        self.d_k = d_k
         self.device = device 
         assert(len(dilation_schedule) == len(segment_schedule))
                     
@@ -388,7 +408,7 @@ class DilatedTransformerBlock(torch.nn.Module):
             segment_schedule = [segment_schedule[i % len(segment_schedule)] for i in range(num_heads)]
             dilation_schedule = [dilation_schedule[i % len(dilation_schedule)] for i in range(num_heads)]
             pos_emb_scaling = [pos_emb_scaling[i % len(pos_emb_scaling)] for i in range(num_heads)]
-        self.d_k = d_k
+
         self.num_heads = num_heads
         self.segment_schedule = segment_schedule
         self.dilation_schedule = dilation_schedule
@@ -404,20 +424,36 @@ class DilatedTransformerBlock(torch.nn.Module):
         ## Positional embeddings:
         self.max_seq_length = max_seq_length # for the construction of "Alibi" positional embeddings.
         self.pos_emb_scaling = pos_emb_scaling
+        self.build_lazy = build_lazy
+        self.emb_dimension = emb_dimension
+        self.segment_length = segment_length
+
+        if self.emb_dimension is not None and (~self.build_lazy):
+            if self.segment_length is None:
+                raise Exception("You also need to provide the segment_length parameter - it is None! (when not building lazily).")
+            t = torch.rand(2, self.segment_length, self.emb_dimension, dtype= DTYPE).to(self.device)
+            self._build(t)
+
 
     def _build(self, x_in):
         """
         Builds the layers given input of a speciffic size
         """
-        self.emb_dimension = x_in.shape[-1]
+        if self.emb_dimension is None:
+            self.emb_dimension = x_in.shape[-1]
 
         
          # self.d_model = self.emb_dimension // self.num_heads
         assert(self.emb_dimension % self.num_heads == 0)
         if (x_in.shape[2] != self.emb_dimension):
             raise Exception('The input size does not seem to be correct! in: %i expected (emb_dimension): %i '%(x_in.shape[2], self.emb_dimension))
+        
         self.per_head_out_size = self.emb_dimension // self.num_heads
 
+        # if d_k is None, the constructor of the following
+        # will make a d_k same as the one implied by the size of the 
+        # embedding and the number of heads (split equally among 
+        # heads)
         mhsa = MultiHeadDilatedAttention(
             d_k = self.d_k,
             d_v = self.per_head_out_size,
