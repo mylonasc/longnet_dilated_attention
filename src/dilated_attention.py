@@ -53,13 +53,11 @@ def _single_head_dilated_segmented_self_attention(
         KQ = KQ * causal_mask
         KQ[:,:,~causal_mask] = float('-inf')
     
-    # if P is not None:
-    #     p_s = x_sliced.shape[-1] * dilation
-    #     segm_count = x_sliced.shape[1]
-    #     p_reshaped = P[:p_s,:p_s].view(p_s//segm_count, segm_count,p_s//segm_count, segm_count)[::dilation,:,::dilation,:]
-    #     p_dilated_segmented = p_reshaped[:,0,:,0]
-    #     # p_dilated_segmented = P[:p_s//dilation,:p_s//dilation]
-    #     KQ = KQ + p_dilated_segmented
+    if P is not None:
+        p_s = x_sliced.shape[-1]
+        # print(p_s//segm_count, segm_count,p_s//segm_count, segm_count)
+        p_reshaped = P[:p_s,:p_s][::dilation,::dilation]
+        KQ = KQ + p_reshaped
     
     smKQ = torch.nn.functional.softmax(KQ * norm_fact, dim = 3)
     att = torch.einsum('ijnm ,ijnk-> ijmk',smKQ, V)
