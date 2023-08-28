@@ -1,9 +1,21 @@
-from typing import Union, List
+from typing import Union, List, Any
 import torch
 import numpy as np
 
 DROPOUT_RATE = 0.2
 DTYPE = torch.float32
+
+
+@torch.compile()
+def _softmax_dim3_get_normalization( x):
+    """
+    Computes softmax along dimension 3 and returns
+    the denominator of the softmax (normalization)
+    """
+    maxes = torch.max(x, 3, keepdim=True)[0]
+    x_exp = torch.exp(x-maxes)
+    x_exp_sum = torch.sum(x_exp, 3, keepdim=True)
+    return x_exp/x_exp_sum, x_exp_sum
 
 def _make_causal_bool(att_length, device = None):
     c = torch.tril(torch.ones(att_length,att_length,dtype=torch.bool)).to(device)
@@ -30,6 +42,7 @@ def _single_head_dilated_segmented_self_attention(
     Q  = torch.einsum('ijkl, mk   ->  ijlm', x_sliced[:,:,:,::dilation],Wq)
     K  = torch.einsum('ijkl, mk   ->  ijlm', x_sliced[:,:,:,::dilation],Wk)
     V  = torch.einsum('ijkl, mk   ->  ijlm', x_sliced[:,:,:,::dilation],Wv)
+
     KQ = torch.einsum('ijkl, ijml ->  ijkm',K, Q)
     if causal_mask is not None:
         KQ = KQ * causal_mask
@@ -40,9 +53,12 @@ def _single_head_dilated_segmented_self_attention(
         p_reshaped = P[:p_s,:p_s][::dilation,::dilation]
         KQ = KQ + p_reshaped
     
-    smKQ = torch.nn.functional.softmax(KQ * norm_fact, dim = 3)
+    # smKQ = torch.nn.functional.softmax(KQ * norm_fact, dim = 3)
+    sm_norm = None
+    smKQ, sm_norm = _softmax_dim3_get_normalization(KQ * norm_fact)
+    
     att = torch.einsum('ijnm ,ijnk-> ijmk',smKQ, V)
-    return att, (K, Q, smKQ)
+    return att, ({'K' : K, 'Q' : Q, 'smKQ' : smKQ, 'sm_norm' : sm_norm})
     
 class SingleHeadDilatedSelfAttention(torch.nn.Module):
     def __init__(
@@ -55,7 +71,8 @@ class SingleHeadDilatedSelfAttention(torch.nn.Module):
             pos_emb_scaling = 1.,
             device = 'cpu',
             padding = 'same',
-            is_causal = True
+            is_causal = True,
+            use_v2 = False
         ):
         super(SingleHeadDilatedSelfAttention, self).__init__()
         """Breaks a sequence to segments and computes dilated single-head attention. 
@@ -85,6 +102,10 @@ class SingleHeadDilatedSelfAttention(torch.nn.Module):
                              multiple heads. 
 
             is_causal : (True/False) whether the layer is a causal (decoder) layer
+
+            use_v2 : a different version of the operation where the KQV are first computed and then "dilated". 
+               the operation is not exactly equivallent, and it may also lead to different computational and
+               fitting performance. 
                              
         """
 
@@ -102,7 +123,6 @@ class SingleHeadDilatedSelfAttention(torch.nn.Module):
         self.is_causal = is_causal
         self.causal_mask = None
         self.pos_emb_scaling = pos_emb_scaling
-
 
     def build_from_in_shape(
             self,
@@ -155,16 +175,27 @@ class SingleHeadDilatedSelfAttention(torch.nn.Module):
                 return (dim1, dim2//self.segment_count, self.d_v)
                 
         raise Exception("Not implemented!")
-        
     
+    def get_same_padded_dilated(self, x_in,att):
+        res = torch.zeros(x_in.shape[0], x_in.shape[1], self.d_v, device = self.device)
+        res[:,::self.dilation,:] = att.reshape(att.shape[0], att.shape[1]*att.shape[2], att.shape[3])
+        return res
+    
+
     def forward(
             self,
             x_in,
             positional_embeddings_KQ = None,
-            return_smKQ = False,
+            return_interm_comps = False
         ):
         """
         optionally pass positional embeddings (the layer itself does not have them!)
+        
+        Args:
+            x_in : the input to be computed
+            positional_embeddings_KQ: 
+            return_smKQ : (false) whether to return the normalized key-querry matrix. 
+            return_sm_norm : (true) whether to return the denominator of the softmax (used for downstream scaling)
         """
         if not self._is_built:
             self.build(x_in)
@@ -173,7 +204,7 @@ class SingleHeadDilatedSelfAttention(torch.nn.Module):
         if positional_embeddings_KQ is not None:
             positional_embeddings_KQ *= self.pos_emb_scaling
 
-        att, (K, Q, smKQ) = _single_head_dilated_segmented_self_attention(
+        att, out_dict = _single_head_dilated_segmented_self_attention(
             x_view, 
             self.Wk,
             self.Wq,
@@ -185,18 +216,18 @@ class SingleHeadDilatedSelfAttention(torch.nn.Module):
         )
         
         if self.padding == 'same':
-            res = torch.zeros(x_in.shape[0], x_in.shape[1], self.d_v, device = self.device)
-            res[:,::self.dilation,:] = att.reshape(att.shape[0], att.shape[1]*att.shape[2], att.shape[3])
+            res = self.get_same_padded_dilated(x_in, att)
             
         if self.padding == 'no_padding':
             res = att.reshape(att.shape[0], att.shape[1]*att.shape[2], att.shape[3])
             
-        if self.padding == 'return_orig_output':
-            res = att            
+        if self.padding == 'return_orig_output' or self.padding is None:
+            res = att
 
-        if return_smKQ:
-            return res, smKQ
-        return res
+        if return_interm_comps:
+            return res, out_dict
+        else:
+            return res
 
 class MultiHeadDilatedAttention(torch.nn.Module):
     def __init__(
@@ -209,6 +240,7 @@ class MultiHeadDilatedAttention(torch.nn.Module):
                 device = 'cpu',
                 is_causal = True,
                 linear_out = True,
+                mha_agg_strategy = 'concat' # softmax_denom
         ):
         super(MultiHeadDilatedAttention, self).__init__()
         """
@@ -226,10 +258,15 @@ class MultiHeadDilatedAttention(torch.nn.Module):
              and shared with all heads (and blocks is there are several blocks). This is achieved by simply passing
              the positional embedding to the "forward" function but scaling it differently for each head (ass suggested)
              by the ALiBI paper). 
+          mha_agg_strategy : ('concat','softmax_denom') hether to aggregate through concatenation or through the softmax  weighted 
+             aggregation technique proposed in the longnet paper (eq 10). This also changes the default behavior with respect 
+             to the determination of the output size d_v (if it is not explicitly provided). 
         """
         self.pos_emb_scaling = pos_emb_scaling
         self.dilation_schedule = dilation_schedule
 
+        assert(mha_agg_strategy in ['concat', 'softmax_denom'])
+        self.mha_agg_strategy = mha_agg_strategy
         if not isinstance(segment_schedule, list):
             print("!! setting the segment schedule to the \
                    same size as the dilation schedule \
@@ -250,7 +287,11 @@ class MultiHeadDilatedAttention(torch.nn.Module):
             # In multi-head attention, d_v
             # is simply = self.d_k * self.num_heads.
             # This allows determining the d_k:
-            self.d_k = self.d_v // self.num_heads
+            if self.mha_agg_strategy == 'concat':
+                self.d_v = self.d_k // self.num_heads
+
+            if self.mha_agg_strategy == 'softmax_denom':
+                self.d_v = self.d_k
             print("determining automatically key and query matrix sizes (internal transformer parameters) through d_v: %i, d_k = d_v/num_heads: %i"%(self.d_v, self.d_k))
                     
         self.segment_schedule = segment_schedule
@@ -279,7 +320,7 @@ class MultiHeadDilatedAttention(torch.nn.Module):
                 d_v = self.d_v,
                 dilation= dilation,
                 segment_count= segment_count,
-                padding='same',
+                padding='return_orig_output',
                 device = self.device,
                 is_causal = self.is_causal,
                 pos_emb_scaling = pos_emb_scaling
@@ -288,9 +329,14 @@ class MultiHeadDilatedAttention(torch.nn.Module):
             self.heads.append(head)
             
         if self.linear_out:
-            concat_out_shape = sum([h.Wv.shape[0] for h in  self.heads])
+            if self.mha_agg_strategy == 'concat':
+                out_shape = sum([h.Wv.shape[0] for h in  self.heads])
+            else:
+                # assuming that all the heads have the same value size:
+                out_shape = self.heads[0].Wv.shape[0]
+
             self.dense_out = torch.nn.Linear(
-                concat_out_shape, 
+                out_shape, 
                 x_in.shape[-1],
                 bias=False, 
                 device = self.device
@@ -302,36 +348,66 @@ class MultiHeadDilatedAttention(torch.nn.Module):
             self, 
             x_in,
             positional_embeddings_KQ = None,
-            return_attention_outputs = False
+            return_attention_outputs = False,
+            use_sm_norm = True,
+            return_att_out = True
+
         ):
         if not self._is_built:
             self.build(x_in)
 
         head_outputs_list = []
-        out_smKQ = []
+        
+        rest_outputs = {}
+
+        def _conditional_append_out_or_make_list(return_x_data : bool, key : str, dat : Any ):
+            if return_x_data:
+                if key not in rest_outputs:
+                    rest_outputs[key] = []
+                rest_outputs[key].append(dat)
+        
+        s_i_O = 0
+        sum_s_i = 0
+        # Take note of eqn 10 of the LongNet paper:
+        # see https://arxiv.org/pdf/2307.02486v2.pdf (eq 10)
+        # In longnet instead of concatenating the outputs of 
+        # different heads, they are weighted proportionally 
+        # according to the denom. of the softmax of the
+        # used in the attention matrix.
+        
         for head_module in self.heads:
-            att, smKQ = head_module.forward(
+            att_raw, rest_dict = head_module.forward(
                 x_in,
                 positional_embeddings_KQ = positional_embeddings_KQ,
-                return_smKQ = True
+                return_interm_comps = True,
+                
             )
+            _conditional_append_out_or_make_list(use_sm_norm, 'sm_norm', rest_dict['sm_norm'])
+            _conditional_append_out_or_make_list(return_att_out, 'att', att_raw)
+            att = head_module.get_same_padded_dilated(x_in, att_raw)
+            if self.mha_agg_strategy == 'softmax_denom':
+                s_i = head_module.get_same_padded_dilated(x_in, rest_dict['sm_norm'])
+                s_i_O += att * s_i
+                sum_s_i += s_i
             head_outputs_list.append(att)
 
-            if return_attention_outputs:            
-                out_smKQ.append(att)
-        head_outputs = torch.cat(head_outputs_list, axis = -1)
+        if self.mha_agg_strategy  == 'softmax_denom':
+            a_i_O = s_i_O / sum_s_i
+            head_outputs = a_i_O
+
+        if self.mha_agg_strategy == 'concat':
+            head_outputs = torch.cat(head_outputs_list, dim = -1)
 
         if self.linear_out:
             hh = self.dense_out(head_outputs)
             hh = self.dropout(hh)
         else:
             hh = self.dropout(head_outputs)
-
-        if return_attention_outputs:
-            return hh, head_outputs_list
+        
+        if len(rest_outputs) > 0:
+            return hh, rest_outputs
         return hh
     
-
 class DilatedTransformerBlock(torch.nn.Module):
     def __init__(
             self,
@@ -339,6 +415,7 @@ class DilatedTransformerBlock(torch.nn.Module):
             num_heads = 16, 
             dilation_schedule = [1,2,4,8],
             segment_schedule = [1024,1024,512,512],
+            mha_agg_strategy = 'softmax_denom',
             max_seq_length = None,
             pos_emb_scaling : Union[float, List[float]] = 1.,
             use_dropout = True,
@@ -373,6 +450,8 @@ class DilatedTransformerBlock(torch.nn.Module):
 
             segment_schedule   :arrays that determine the segment size schedules.
 
+            mha_agg_strategy : (concat/softmax_denom) - the aggregation for the MHA layer (concat or weighted add as in longnet paper.)
+
             max_seq_length  : the maximum length of the sequence (it helps with efficiency to keep this static)
             
             pos_emb_scaling : (same size as the heads) - scaling for the positional embeddings (can be different for each head as in ALiBI)
@@ -400,6 +479,8 @@ class DilatedTransformerBlock(torch.nn.Module):
 
         self.d_k = d_k
         self.device = device 
+        self.mha_agg_strategy = mha_agg_strategy
+
         assert(len(dilation_schedule) == len(segment_schedule))
                     
         self.out_linear_size = out_linear_size
@@ -461,7 +542,8 @@ class DilatedTransformerBlock(torch.nn.Module):
             dilation_schedule = self.dilation_schedule,
             pos_emb_scaling = self.pos_emb_scaling,
             device = self.device,
-            is_causal = self.is_causal
+            is_causal = self.is_causal,
+            mha_agg_strategy=self.mha_agg_strategy
         )
 
         mhsa.build(x_in)
@@ -498,7 +580,7 @@ class DilatedTransformerBlock(torch.nn.Module):
                 h, positional_embedding_KQ, return_attention_outputs = True
             )
         else:
-            mhsa_out = self.mhsa_module.forward(
+            mhsa_out,_ = self.mhsa_module.forward(
                 h,
                 positional_embedding_KQ, 
                 return_attention_outputs = False

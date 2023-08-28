@@ -35,7 +35,8 @@ class LongNetDecoder(torch.nn.Module):
             device = None,
             tokenizer = None,
             segment_length = None,
-            build_lazy = False
+            build_lazy = False,
+            mha_agg_strategy = 'softmax_denom'
         ):
         super(LongNetDecoder, self).__init__()
         """
@@ -53,6 +54,7 @@ class LongNetDecoder(torch.nn.Module):
           emb_dic_len : the output logits size
           emb_dim : the embedding dimension. It must be divisible by the number of heads.
         """
+        self.mha_agg_strategy = mha_agg_strategy
         if emb_dic_len is None:
             raise Exception("You need to specify the size of the vocabulary!")
         
@@ -97,7 +99,6 @@ class LongNetDecoder(torch.nn.Module):
 
 
     def _build(self, x_in):
-
         self.blocks = torch.nn.ModuleList(
             [
                 DilatedTransformerBlock(
@@ -109,7 +110,8 @@ class LongNetDecoder(torch.nn.Module):
                     device = self.device,
                     build_lazy = False,
                     emb_dimension= self.emb_dim,
-                    segment_length = self.segment_length
+                    segment_length = self.segment_length,
+                    mha_agg_strategy = self.mha_agg_strategy
                 ) for i in range(self.n_layers)
             ]
         )
@@ -139,7 +141,10 @@ class LongNetDecoder(torch.nn.Module):
             init_text,
             num_tokens = 100
         ):
-        
+        if num_tokens > self.segment_length:
+            print("A number of tokens (%i) larger than max segment length (%i) was given for generation. Setting tokens to generate to models' max."%(num_tokens , self.segment_length))
+            num_tokens = self.segment_length
+
         tok = self.tokenizer
         tokenized_text = tok.tokenize(init_text)
         if tokenized_text[0] == '<s>':
@@ -148,7 +153,9 @@ class LongNetDecoder(torch.nn.Module):
         codes = tok.encode(init_text, return_tensors='pt',).to(self.device)
         for i in range(num_tokens):
             size_zeros = self.model_length - codes.shape[1]
-            zeropad = torch.zeros(size_zeros, device = device, dtype = torch.long).reshape(1,-1)
+            if size_zeros < 0:
+                break
+            zeropad = torch.zeros(size_zeros, device = self.device, dtype = torch.long).reshape(1,-1)
             codes_for_model = torch.cat([codes, zeropad], dim = 1)
             new_codes = self.forward(codes_for_model)[0,len(codes)+1,:]
             p = torch.nn.functional.softmax(new_codes,dim = -1)

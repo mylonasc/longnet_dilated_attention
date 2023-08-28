@@ -16,7 +16,46 @@ class TestModules(unittest.TestCase):
         res = model(x)
 
         # return also the attention layer:
-        res, smKQ = model.forward(x,return_smKQ=True)
+        res = model.forward(x,  return_interm_comps=True)
+
+    def test_mhsa_construction(self):
+        """
+        This tests the construction strategies for MHSA
+        In particular, it is tested that the initialization
+        happens:
+        """
+        from src.dilated_attention import MultiHeadDilatedAttention
+        import torch
+        d_k, d_v = 256,654
+        dilation_schedule = [1,2]
+        segm_schedule = [64,64]
+        pos_emb_scaling = 1.
+
+        ## test concatenation-head-aggregation transformer (the classic one):
+        mha = MultiHeadDilatedAttention(
+            d_k,
+            d_v, 
+            dilation_schedule,
+            segm_schedule,
+            pos_emb_scaling, 
+            device=device, 
+            mha_agg_strategy = 'concat'
+        )
+        t = torch.randn(10,2048, 123).to(device)
+        att, rest = mha.forward(t)
+
+        ## test concatenation-head-aggregation transformer (the longnet-type - eq 10):
+        mha = MultiHeadDilatedAttention(
+            d_k,
+            d_v, 
+            dilation_schedule,
+            segm_schedule,
+            pos_emb_scaling, 
+            device=device, 
+            mha_agg_strategy = 'softmax_denom'
+        )
+        t = torch.randn(10,2048, 123).to(device)
+        att, rest = mha.forward(t)
 
     def test_longnet_construction(self):
         from src.longnet import LongNetDecoder
