@@ -71,8 +71,7 @@ class SingleHeadDilatedSelfAttention(torch.nn.Module):
             pos_emb_scaling = 1.,
             device = 'cpu',
             padding = 'same',
-            is_causal = True,
-            use_v2 = False
+            is_causal = True
         ):
         super(SingleHeadDilatedSelfAttention, self).__init__()
         """Breaks a sequence to segments and computes dilated single-head attention. 
@@ -228,6 +227,192 @@ class SingleHeadDilatedSelfAttention(torch.nn.Module):
             return res, out_dict
         else:
             return res
+
+class SingleHeadDilatedSelfAttentionV2(torch.nn.Module):
+    def __init__(
+            self,
+            d_k = None,
+            d_v = None,
+            d_model = None,
+            dilations = 1,
+            segment_counts = 16,
+            pos_emb_scaling = 1.,
+            device = 'cpu',
+            padding = 'same',
+            is_causal = True
+        ):
+        super(SingleHeadDilatedSelfAttentionV2, self).__init__()
+        """Breaks a sequence to segments and computes dilated single-head attention. 
+        
+        This one, in contrast to V1, it takes a list of dilations/segment lengths, and 
+        creates an attention output for a shared (within layers) KQV.
+
+        This module returns tensors of smaller size than the ones entered, except if dilation==1
+        
+        Does some dangerous tricks with reshaping and einsums.
+        
+        Args:
+            d_k : the size of the projection 
+
+            d_v : the "value" size (can be different from "key")
+
+            d_model : the model size (K.shape == (d_k x d_model)) - i.e., the "linear layer" 
+                      matrix that implements the non-linearities internal to this layer
+
+            dilations : how many elements are skipped from the sequence (==1 no element is skipped, ==2, every 1 element)
+
+            segment_counts : the size of the segments that the input sequence is first split (before 
+                       using the dilation). 
+
+            device   : in which device to keep the layer
+
+            padding : ('same','valid', 'return_orig_output') with "same" padding, 
+                             the length of the output is shaped to have the same
+                             size as the original input length. Convenient for adding 
+                             multiple heads. 
+
+            is_causal : (True/False) whether the layer is a causal (decoder) layer
+
+            use_v2 : a different version of the operation where the KQV are first computed and then "dilated". 
+               the operation is not exactly equivallent, and it may also lead to different computational and
+               fitting performance. 
+                             
+        """
+
+        self.d_k = d_k
+        if d_v is None:
+            d_v = d_k
+        self.d_v = d_v
+        self.d_model = d_model
+        self.dilations = dilations
+        self.segment_counts = segment_counts
+        self.device = device 
+        self._is_built = False
+        self.norm_fact = torch.scalar_tensor(1./np.sqrt(self.d_k)).to(device)
+        self.padding = padding
+        self.is_causal = is_causal
+        self.causal_mask = None
+        self.pos_emb_scaling = pos_emb_scaling
+
+    def build_from_in_shape(
+            self,
+            in_shape
+        ):
+        """
+        Builds the necessary weights if not already available.
+        Assuming B x T x E tensor ( (batch dim) x (time dim) x (embedding dim) )
+        """
+        assert(len(in_shape) == 3)
+            
+        if self.d_model is None:
+            self.d_model = in_shape[2]
+
+        def _get_param(k,m):
+            v = torch.randn((k,m) , dtype = DTYPE, device = self.device) / torch.math.sqrt(k)
+            p = torch.nn.Parameter(v)
+            p.requires_grad = True
+            return p
+        
+        self.Wk = _get_param(self.d_k, self.d_model)
+        self.Wq = _get_param(self.d_k,self.d_model)
+        self.Wv = _get_param(self.d_v,self.d_model)
+
+        self._is_built = True
+        if self.is_causal:
+            raise Exception("Not implemented correctly at the moment!")
+            self.causal_mask = _make_causal_bool(in_shape[1]//self.segment_count, device =self.device)[::self.dilation, ::self.dilation]
+
+        self.dropout = torch.nn.Dropout(DROPOUT_RATE)
+
+    def build(self, x_in):
+        self.build_from_in_shape(x_in.shape)
+            
+    def get_head_weights(self):
+        return self.Wk, self.Wq, self.Wv
+    
+    def output_shape(
+            self,
+            x_in = None
+        ):
+        if self._is_built:
+            dim1 = None
+            dim2 = None
+            if x_in is not None:
+                dim1 = x_in.shape[0]
+                dim2 = x_in.shape[1]
+            
+            if self.padding == 'same':
+                return (dim1, dim2, self.d_v)
+                
+            if self.padding =='no_padding':
+                return (dim1, dim2//self.segment_count, self.d_v)
+                
+        raise Exception("Not implemented!")
+    
+    def get_same_padded_dilated(self, x_in,att):
+        res = torch.zeros(x_in.shape[0], x_in.shape[1], self.d_v, device = self.device)
+        res[:,::self.dilation,:] = att.reshape(att.shape[0], att.shape[1]*att.shape[2], att.shape[3])
+
+    def forward(
+            self,
+            x_in,
+            positional_embeddings_KQ = None,
+            return_interm_comps = False
+        ):
+        """
+        optionally pass positional embeddings (the layer itself does not have them!)
+        
+        Args:
+            x_in : the input to be computed
+            positional_embeddings_KQ: 
+            return_smKQ : (false) whether to return the normalized key-querry matrix. 
+            return_sm_norm : (true) whether to return the denominator of the softmax (used for downstream scaling)
+        """
+        if not self._is_built:
+            self.build(x_in)
+        
+        
+        # if positional_embeddings_KQ is not None:
+        #     positional_embeddings_KQ *= self.pos_emb_scaling
+        
+        x_out_aiO = torch.zeros(x_in.shape[0], x_in.shape[1], self.d_v, device = self.device)
+        s_accum  = torch.zeros(x_in.shape[0], x_in.shape[1], self.d_v, device = self.device)
+        for dilation, segment_count, pos_emb_weight in zip(self.dilations, self.segment_counts, self.pos_emb_scaling):
+            
+            x_view = x_in.view(x_in.shape[0],x_in.shape[1]//segment_count, segment_count, x_in.shape[2]).permute(0,2,3,1)
+
+            att, out_dict = _single_head_dilated_segmented_self_attention(
+                x_view, 
+                self.Wk,
+                self.Wq,
+                self.Wv,
+                P = positional_embeddings_KQ * pos_emb_weight,
+                dilation = dilation,
+                norm_fact= self.norm_fact,
+                causal_mask = self.causal_mask,
+            )
+
+            att_raw = att.reshape(att.shape[0], att.shape[1] * att.shape[2], att.shape[3])
+            smn = out_dict['sm_norm']
+            s_i = smn.reshape(smn.shape[0], smn.shape[1] * smn.shape[2], smn.shape[3])
+            x_out_aiO[:,::dilation,:] += att_raw * s_i
+            s_accum[:,::dilation,:] += s_i
+
+        att_out = x_out_aiO / s_accum
+        return att_out
+        # if self.padding == 'same':
+        #     res = self.get_same_padded_dilated(x_in, att)
+            
+        # if self.padding == 'no_padding':
+        #     res = att.reshape(att.shape[0], att.shape[1]*att.shape[2], att.shape[3])
+            
+        # if self.padding == 'return_orig_output' or self.padding is None:
+        #     res = att
+
+        # if return_interm_comps:
+        #     return res, out_dict
+        # else:
+        #     return res
 
 class MultiHeadDilatedAttention(torch.nn.Module):
     def __init__(
