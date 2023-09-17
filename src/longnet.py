@@ -36,7 +36,7 @@ class LongNetDecoder(torch.nn.Module):
             tokenizer = None,
             segment_length = None,
             build_lazy = False,
-            mha_agg_strategy = 'softmax_denom'
+            # mha_agg_strategy = 'softmax_denom'
         ):
         super(LongNetDecoder, self).__init__()
         """
@@ -54,25 +54,24 @@ class LongNetDecoder(torch.nn.Module):
           emb_dic_len : the output logits size
           emb_dim : the embedding dimension. It must be divisible by the number of heads.
         """
-        self.mha_agg_strategy = mha_agg_strategy
+        # self.mha_agg_strategy = mha_agg_strategy
         if emb_dic_len is None:
             raise Exception("You need to specify the size of the vocabulary!")
         
-        self.d_k = d_k # if None, it is determined  in the `DilatedTransformerBlock` 
+        self.d_k = d_k # if None, it is determined  in the `DilatedTransformerBlock`
+
         self.dilation_schedule = dilation_schedule
         self.segment_schedule = segment_schedule
         self.num_heads = num_heads
         
         # if the number of heads is larger than the "dilation_schedule" and the "segment_schedule"
         # during build the dilation and segment schedule are repeated the necessary number of times.
-
         self.n_layers = n_layers
 
-        # Emb dim should be evenly dividable with the number of heads (each head 
-        # returns for a different part of the embedding and then "mixed" through
-        # a emb x emb matrix mult.
+        # Emb dim should be evenly dividable with the number of heads.
         self.emb_dim = emb_dim
         self.emb_dic_len = emb_dic_len
+
         self._is_built = False
         self.device = device 
         self.model_min_length = int(np.max([d * s for d, s in zip(self.dilation_schedule, self.segment_schedule)]))
@@ -83,7 +82,7 @@ class LongNetDecoder(torch.nn.Module):
         if segment_length is not None:
             P = _make_alibi(
                 self.segment_length,
-                m = 1/self.segment_length,
+                m = 1.,
                 is_causal = True,
                 device = self.device
             )
@@ -97,21 +96,19 @@ class LongNetDecoder(torch.nn.Module):
             t = torch.zeros(2,self.segment_length, dtype = torch.long).to(self.device)
             self._build(t)
 
-
     def _build(self, x_in):
         self.blocks = torch.nn.ModuleList(
             [
                 DilatedTransformerBlock(
-                    d_k = self.d_k,
-                    num_heads=self.num_heads,
+                    d_k       = self.d_k,
+                    d_model   = self.emb_dim,
+                    num_heads = self.num_heads,
                     dilation_schedule = self.dilation_schedule,
-                    segment_schedule = self.segment_schedule,
-                    pos_emb_scaling = self.pos_emb_scaling,
-                    device = self.device,
-                    build_lazy = False,
-                    emb_dimension= self.emb_dim,
-                    segment_length = self.segment_length,
-                    mha_agg_strategy = self.mha_agg_strategy
+                    segment_schedule  = self.segment_schedule,
+                    pos_emb_scaling = self.pos_emb_scaling, # per head
+                    device          = self.device,
+                    build_lazy      = False,
+                    segment_length  = self.segment_length
                 ) for i in range(self.n_layers)
             ]
         )
@@ -165,7 +162,6 @@ class LongNetDecoder(torch.nn.Module):
             
         return text_to_print
     
-        
     def forward(self, x_in, get_layer_outputs = False):
         """
         x_in is an iterable with integers.
@@ -179,9 +175,12 @@ class LongNetDecoder(torch.nn.Module):
             if not get_layer_outputs:
                 x_curr = m(x_curr, positional_embedding_KQ = self.P.clone())
             else:
-                x_curr, outputs = m.forward(x_curr, positional_embedding_KQ = self.P.clone(), att_outputs = True)
+                x_curr, outputs = m.forward(
+                    x_curr, 
+                    positional_embedding_KQ = self.P.clone(),
+                    att_outputs = True
+                )
                 att_layer_outputs.append(outputs)
-        
         logits = self.out_layer(x_curr)
         if get_layer_outputs:
             return logits , att_layer_outputs
