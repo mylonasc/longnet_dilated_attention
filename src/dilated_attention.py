@@ -234,8 +234,8 @@ class SingleHeadDilatedSelfAttentionV2(torch.nn.Module):
             d_k = None,
             d_v = None,
             d_model = None,
-            dilations = 1,
-            segment_counts = 16,
+            dilation_schedule = 1,
+            segment_schedule = 16,
             pos_emb_scaling = 1.,
             device = 'cpu',
             padding = 'same',
@@ -260,9 +260,9 @@ class SingleHeadDilatedSelfAttentionV2(torch.nn.Module):
             d_model : the model size (K.shape == (d_k x d_model)) - i.e., the "linear layer" 
                       matrix that implements the non-linearities internal to this layer
 
-            dilations : how many elements are skipped from the sequence (==1 no element is skipped, ==2, every 1 element)
+            dilation_schedule : how many elements are skipped from the sequence (==1 no element is skipped, ==2, every 1 element)
 
-            segment_counts : the size of the segments that the input sequence is first split (before 
+            segment_schedule : the size of the segments that the input sequence is first split (before 
                        using the dilation). 
 
             device   : in which device to keep the layer
@@ -285,8 +285,8 @@ class SingleHeadDilatedSelfAttentionV2(torch.nn.Module):
             d_v = d_k
         self.d_v = d_v
         self.d_model = d_model
-        self.dilations = dilations
-        self.segment_counts = segment_counts
+        self.dilation_schedule = dilation_schedule
+        self.segment_schedule = segment_schedule
         self.device = device 
         self._is_built = False
         self.norm_fact = torch.scalar_tensor(1./np.sqrt(self.d_k)).to(device)
@@ -332,29 +332,6 @@ class SingleHeadDilatedSelfAttentionV2(torch.nn.Module):
     def get_head_weights(self):
         return self.Wk, self.Wq, self.Wv
     
-    def output_shape(
-            self,
-            x_in = None
-        ):
-        if self._is_built:
-            dim1 = None
-            dim2 = None
-            if x_in is not None:
-                dim1 = x_in.shape[0]
-                dim2 = x_in.shape[1]
-            
-            if self.padding == 'same':
-                return (dim1, dim2, self.d_v)
-                
-            if self.padding =='no_padding':
-                return (dim1, dim2//self.segment_count, self.d_v)
-                
-        raise Exception("Not implemented!")
-    
-    def get_same_padded_dilated(self, x_in,att):
-        res = torch.zeros(x_in.shape[0], x_in.shape[1], self.d_v, device = self.device)
-        res[:,::self.dilation,:] = att.reshape(att.shape[0], att.shape[1]*att.shape[2], att.shape[3])
-
     def forward(
             self,
             x_in,
@@ -387,7 +364,7 @@ class SingleHeadDilatedSelfAttentionV2(torch.nn.Module):
         else:
             scaled_P = None
         
-        for dilation, segment_count in zip(self.dilations, self.segment_counts):
+        for dilation, segment_count in zip(self.dilation_schedule, self.segment_schedule):
             segm_size = x_in.shape[1]//segment_count
             x_view = x_in.view(x_in.shape[0],segm_size, segment_count, x_in.shape[2]).permute(0,2,3,1)
             if self.causal_mask is not None:
@@ -669,7 +646,7 @@ class MultiHeadDilatedAttention(torch.nn.Module):
         self.heads = torch.nn.ModuleList()
         if self.pos_emb_scaling is None:
             print("setting automatically all pos embedding scalings to 1. ")
-            self.pos_emb_scaling = [1. for i in range(len(self.dilation_schedule))]
+            self.pos_emb_scaling = [1. for i in range(self.n_heads)]
 
         # if isinstance(self.pos_emb_scaling,float):
             # print("setting all pos embedding scalings to %2.3f "%(self.pos_emb_scaling))
@@ -681,8 +658,8 @@ class MultiHeadDilatedAttention(torch.nn.Module):
                 d_k = self.d_k,
                 d_v = self.d_v,
                 d_model = self.d_model,
-                dilations= self.dilation_schedule,
-                segment_counts= self.segment_schedule,
+                dilation_schedule = self.dilation_schedule,
+                segment_schedule= self.segment_schedule,
                 padding='same',
                 device = self.device,
                 is_causal = self.is_causal,
@@ -728,7 +705,7 @@ class DilatedTransformerBlock(torch.nn.Module):
             self,
             d_k = None,
             d_model = None,
-            num_heads = 16, 
+            n_heads = 16, 
             dilation_schedule : List[int] = [1,2,4,8],
             segment_schedule : List[int] = [1024,1024,512,512],
             max_seq_length = None,
@@ -759,7 +736,7 @@ class DilatedTransformerBlock(torch.nn.Module):
         Args:
             d_k : the internal size of the key and querry matrices. If it is not provided it is 
                   determined from d_v and num_heads.
-            num_heads : The number of heads for the MHSA layers
+            n_heads : The number of heads for the MHSA layers
             dilation_schedule : list that determines the dilation schedule (for 
                 each head).
             segment_schedule  : list that determine the segment size schedule
@@ -797,7 +774,7 @@ class DilatedTransformerBlock(torch.nn.Module):
                     
         self.out_linear_inner_size = out_linear_size
 
-        if num_heads != len(pos_emb_scaling):
+        if n_heads != len(pos_emb_scaling):
             raise Exception('The number of scaling factors for the positional embeddings \n\
                             should be the same as the number of heads.')
 
@@ -805,7 +782,7 @@ class DilatedTransformerBlock(torch.nn.Module):
         #     # dilation_schedule = [dilation_schedule[i % len(dilation_schedule)] for i in range(num_heads)]
         #     pos_emb_scaling = [pos_emb_scaling[i % len(pos_emb_scaling)] for i in range(num_heads)]
 
-        self.num_heads = num_heads
+        self.num_heads = n_heads
         self.segment_schedule = segment_schedule
         self.dilation_schedule = dilation_schedule
         self._is_built = False
@@ -903,9 +880,13 @@ class DilatedTransformerBlock(torch.nn.Module):
             h,
             positional_embedding_KQ
         )
+        # print('x_in: ',x_in.shape)
+        # print('mhsa_out' , mhsa_out.shape)
+        # mhsa_out_sum = torch.sum(mhsa_out,dim = 1) # dim 1 should be the batch dimension
+        # print('mhsa_out_sum' , mhsa_out_sum.shape)
 
-        mhsa_out_sum = torch.sum(mhsa_out,dim = 1) # dim 1 should be the batch dimension
-        h = self.layer_norm_b(mhsa_out_sum + x_in)
+        ss  = mhsa_out + x_in
+        h = self.layer_norm_b(ss)
         h = self.out_dense(h)        
         return h
     

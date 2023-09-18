@@ -49,7 +49,6 @@ class TestModules(unittest.TestCase):
         t = torch.randn(10,2048, d_v * n_heads).to(device)
         att = mha.forward(t)
 
-
     def test_mhsa_constructionV1(self):
         """
         This tests the construction strategies for a dilated MHSA 
@@ -92,6 +91,12 @@ class TestModules(unittest.TestCase):
         t = torch.randn(10,2048, 123).to(device)
         att, rest = mha.forward(t)
 
+    def test_longnet_block_construction(self):
+        """
+        Tests the construction of a longnet block
+        """
+        
+
     def test_longnet_construction(self):
         from src.longnet import LongNetDecoder
         SEGMENT_LENGTH = 1024
@@ -112,7 +117,7 @@ class TestModules(unittest.TestCase):
         model = LongNetDecoder(
             d_k = 32,
             n_layers = N_LAYERS,
-            num_heads = num_heads,
+            n_heads = num_heads,
             dilation_schedule = dilation_schedule,
             segment_schedule = segment_schedule,
             segment_length=SEGMENT_LENGTH,

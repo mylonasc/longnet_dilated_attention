@@ -25,7 +25,7 @@ class LongNetDecoder(torch.nn.Module):
     def __init__(
             self,
             n_layers = 2,
-            num_heads = 6,
+            n_heads = 6,
             dilation_schedule = [1], 
             segment_schedule = [512],
             pos_emb_scaling = [0.1],
@@ -62,7 +62,7 @@ class LongNetDecoder(torch.nn.Module):
 
         self.dilation_schedule = dilation_schedule
         self.segment_schedule = segment_schedule
-        self.num_heads = num_heads
+        self.n_heads = n_heads
         
         # if the number of heads is larger than the "dilation_schedule" and the "segment_schedule"
         # during build the dilation and segment schedule are repeated the necessary number of times.
@@ -102,7 +102,7 @@ class LongNetDecoder(torch.nn.Module):
                 DilatedTransformerBlock(
                     d_k       = self.d_k,
                     d_model   = self.emb_dim,
-                    num_heads = self.num_heads,
+                    n_heads = self.n_heads,
                     dilation_schedule = self.dilation_schedule,
                     segment_schedule  = self.segment_schedule,
                     pos_emb_scaling = self.pos_emb_scaling, # per head
